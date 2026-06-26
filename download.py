@@ -27,6 +27,7 @@ import argparse
 import requests
 from pathlib import Path
 from urllib.parse import urlencode
+from datetime import datetime
 
 BASE_URL = "https://api.gopro.com"
 MEDIA_FIELDS = (
@@ -35,9 +36,14 @@ MEDIA_FIELDS = (
     "captured_at,created_at,file_size,camera_model,content_title"
 )
 
-DATE = "06-05-2023"
-# Flip DD-MM-YYYY → YYYY-MM-DD to match the captured_at field from the API
-_DATE_ISO = "-".join(reversed(DATE.split("-")))
+
+def parse_date(s: str) -> str:
+    """Parse DD-MM-YYYY and return YYYY-MM-DD, or exit with a helpful error."""
+    try:
+        return datetime.strptime(s, "%d-%m-%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        print(f"ERROR: '{s}' is not a valid date. Use DD-MM-YYYY format, e.g. 30-04-2023")
+        sys.exit(1)
 
 
 def build_session(cookies_str: str | None = None, token: str | None = None) -> requests.Session:
@@ -55,7 +61,6 @@ def build_session(cookies_str: str | None = None, token: str | None = None) -> r
     })
 
     if cookies_str:
-        # Parse "key=value; key2=value2; ..." into a dict
         for part in cookies_str.split(";"):
             part = part.strip()
             if "=" in part:
@@ -114,10 +119,8 @@ def get_download_url(session: requests.Session, media_id: str) -> str | None:
         return None
     data = resp.json()
 
-    # The response nests the URL under _embedded.variations or directly
     variations = data.get("_embedded", {}).get("variations", [])
     if variations:
-        # Prefer the highest-quality / largest variation
         best = max(variations, key=lambda v: v.get("width", 0) or 0)
         return best.get("url") or variations[0].get("url")
 
@@ -161,17 +164,27 @@ def delete_media(session: requests.Session, media_ids: list[str]):
 
 def download_all(
     session: requests.Session,
+    date_from: str,
+    date_to: str,
     output_dir: Path,
     dry_run: bool = False,
     delete_after: bool = False,
 ):
+    """
+    date_from / date_to are ISO format (YYYY-MM-DD). ISO dates sort
+    lexicographically, so plain string comparison works for range filtering.
+    """
     all_items = list_all_media(session)
-    media_items = [m for m in all_items if (m.get("captured_at") or "").startswith(_DATE_ISO)]
+    media_items = [
+        m for m in all_items
+        if date_from <= (m.get("captured_at") or "")[:10] <= date_to
+    ]
 
-    print(f"Filtered to {len(media_items)} item(s) captured on {DATE}.\n")
+    label = date_from if date_from == date_to else f"{date_from} to {date_to}"
+    print(f"Filtered to {len(media_items)} item(s) captured {label}.\n")
 
     if not media_items:
-        print("No media found for that date.")
+        print("No media found for that date range.")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -186,7 +199,7 @@ def download_all(
         if dest.exists():
             print(f"[{i}/{len(media_items)}] SKIP  {filename}")
             skipped += 1
-            downloaded_ids.append(item["id"])  # already on disk — safe to delete
+            downloaded_ids.append(item["id"])
             continue
 
         captured = (item.get("captured_at") or "")[:10]
@@ -226,18 +239,42 @@ def download_all(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download all videos from your GoPro cloud library.",
+        description="Download videos/photos from your GoPro cloud library by date.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
+    # Auth
     auth = parser.add_mutually_exclusive_group(required=True)
     auth.add_argument("--cookies", help="Full cookie string copied from browser DevTools")
     auth.add_argument("--cookie-file", help="Path to a text file containing the cookie string")
     auth.add_argument("--token", help="Just the gp_access_token value from the cookie")
 
+    # Date selection — single date OR explicit range
+    date_group = parser.add_mutually_exclusive_group(required=True)
+    date_group.add_argument(
+        "--date",
+        metavar="DD-MM-YYYY",
+        help="Download media captured on a single date",
+    )
+    date_group.add_argument(
+        "--from",
+        dest="date_from",
+        metavar="DD-MM-YYYY",
+        help="Start of date range (inclusive). Must be used with --to",
+    )
+
     parser.add_argument(
-        "--output", default=f"./gopro_downloads/{DATE}",
-        help=f"Directory to save files (default: ./gopro_downloads/{DATE})",
+        "--to",
+        dest="date_to",
+        metavar="DD-MM-YYYY",
+        help="End of date range (inclusive). Required when using --from",
+    )
+
+    parser.add_argument(
+        "--output",
+        metavar="PATH",
+        help="Directory to save files (default: ./gopro_downloads/<date>)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -247,11 +284,30 @@ def main():
         "--delete-after", action="store_true",
         help="Delete files from GoPro cloud after ALL of them download successfully",
     )
+
     args = parser.parse_args()
 
+    # Validate date arguments
+    if args.date_from and not args.date_to:
+        parser.error("--from requires --to")
+    if args.date_to and not args.date_from:
+        parser.error("--to requires --from")
+
+    if args.date:
+        date_from = date_to = parse_date(args.date)
+        folder_name = args.date
+    else:
+        date_from = parse_date(args.date_from)
+        date_to = parse_date(args.date_to)
+        if date_from > date_to:
+            parser.error("--from date must not be after --to date")
+        folder_name = f"{args.date_from}_to_{args.date_to}"
+
+    output_dir = Path(args.output) if args.output else Path(f"./gopro_downloads/{folder_name}")
+
+    # Build session
     cookies_str = None
     token = None
-
     if args.cookies:
         cookies_str = args.cookies
     elif args.cookie_file:
@@ -263,7 +319,9 @@ def main():
 
     download_all(
         session=session,
-        output_dir=Path(args.output),
+        date_from=date_from,
+        date_to=date_to,
+        output_dir=output_dir,
         dry_run=args.dry_run,
         delete_after=args.delete_after,
     )
