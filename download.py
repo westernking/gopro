@@ -28,6 +28,8 @@ import requests
 from pathlib import Path
 from urllib.parse import urlencode
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 BASE_URL = "https://api.gopro.com"
 MEDIA_FIELDS = (
@@ -59,6 +61,16 @@ def build_session(cookies_str: str | None = None, token: str | None = None) -> r
             "Chrome/149.0.0.0 Safari/537.36"
         ),
     })
+
+    # Retry transient failures on all API calls (not streaming downloads — those
+    # are handled separately in download_file with resume support).
+    retry = Retry(
+        total=5,
+        backoff_factor=1,          # waits 1, 2, 4, 8, 16 s between retries
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "DELETE"},
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
 
     if cookies_str:
         for part in cookies_str.split(";"):
@@ -114,42 +126,73 @@ def list_all_media(session: requests.Session) -> list[dict]:
 
 def get_download_url(session: requests.Session, media_id: str) -> str | None:
     """Ask the API for the original-quality download URL for a media item."""
-    resp = session.get(f"{BASE_URL}/media/{media_id}/download", timeout=30)
-    if resp.status_code != 200:
-        return None
-    data = resp.json()
-
-    variations = data.get("_embedded", {}).get("variations", [])
-    if variations:
-        best = max(variations, key=lambda v: v.get("width", 0) or 0)
-        return best.get("url") or variations[0].get("url")
-
-    return data.get("url")
-
-
-def download_file(url: str, dest_path: Path, session: requests.Session) -> bool:
-    """Stream-download a file with a simple progress display."""
     try:
-        with session.get(url, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            with open(dest_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        pct = downloaded * 100 // total
-                        mb_done = downloaded / 1024 / 1024
-                        mb_total = total / 1024 / 1024
-                        print(f"\r    {pct:3d}%  {mb_done:.1f} / {mb_total:.1f} MB", end="", flush=True)
-            print()
-        return True
+        resp = session.get(f"{BASE_URL}/media/{media_id}/download", timeout=30)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+
+        variations = data.get("_embedded", {}).get("variations", [])
+        if variations:
+            best = max(variations, key=lambda v: v.get("width", 0) or 0)
+            return best.get("url") or variations[0].get("url")
+
+        return data.get("url")
     except Exception as e:
-        print(f"\n    Download error: {e}")
-        if dest_path.exists():
-            dest_path.unlink()
-        return False
+        print(f"    Warning: could not fetch download URL ({e})")
+        return None
+
+
+def download_file(url: str, dest_path: Path, session: requests.Session, max_retries: int = 5) -> bool:
+    """Stream-download a file, resuming from a .part file on failure."""
+    part = dest_path.with_suffix(dest_path.suffix + ".part")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            offset = part.stat().st_size if part.exists() else 0
+            headers = {"Range": f"bytes={offset}-"} if offset else {}
+
+            with session.get(url, stream=True, timeout=120, headers=headers) as resp:
+                if resp.status_code == 416:  # range not satisfiable — already complete
+                    part.rename(dest_path)
+                    print()
+                    return True
+                resp.raise_for_status()
+
+                if resp.status_code == 206:
+                    total = offset + int(resp.headers.get("content-length", 0))
+                    mode = "ab"
+                else:  # 200 — server ignored Range, restart
+                    offset = 0
+                    total = int(resp.headers.get("content-length", 0))
+                    mode = "wb"
+
+                downloaded = offset
+                with open(part, mode) as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded * 100 // total
+                            print(
+                                f"\r    {pct:3d}%  {downloaded/1024/1024:.1f} / {total/1024/1024:.1f} MB",
+                                end="", flush=True,
+                            )
+
+            print()
+            part.rename(dest_path)
+            return True
+
+        except Exception as e:
+            print(f"\n    Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"    Retrying in {wait}s...")
+                time.sleep(wait)
+
+    if part.exists():
+        part.unlink()
+    return False
 
 
 def delete_media(session: requests.Session, media_ids: list[str]):
@@ -187,14 +230,15 @@ def download_all(
         print("No media found for that date range.")
         return
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     succeeded, skipped, failed = 0, 0, 0
     downloaded_ids = []
 
     for i, item in enumerate(media_items, 1):
         filename = item.get("filename") or f"media_{item['id']}"
-        dest = output_dir / filename
+        captured = (item.get("captured_at") or "")[:10]
+        dest_dir = output_dir / captured if captured else output_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / filename
 
         if dest.exists():
             print(f"[{i}/{len(media_items)}] SKIP  {filename}")
@@ -202,7 +246,6 @@ def download_all(
             downloaded_ids.append(item["id"])
             continue
 
-        captured = (item.get("captured_at") or "")[:10]
         size_mb = (item.get("file_size") or 0) / 1024 / 1024
         media_type = item.get("type", "")
         print(f"[{i}/{len(media_items)}] {filename}  {media_type}  {captured}  {size_mb:.0f} MB")
@@ -230,11 +273,9 @@ def download_all(
     if delete_after and not dry_run:
         if failed > 0:
             print(f"\nSkipping cloud delete — {failed} file(s) failed to download.")
-        elif len(downloaded_ids) == len(media_items):
+        else:
             print(f"\nAll {len(media_items)} file(s) accounted for locally. Deleting from GoPro cloud...")
             delete_media(session, downloaded_ids)
-        else:
-            print("\nSkipping cloud delete — not all files were accounted for.")
 
 
 def main():
@@ -295,15 +336,13 @@ def main():
 
     if args.date:
         date_from = date_to = parse_date(args.date)
-        folder_name = args.date
     else:
         date_from = parse_date(args.date_from)
         date_to = parse_date(args.date_to)
         if date_from > date_to:
             parser.error("--from date must not be after --to date")
-        folder_name = f"{args.date_from}_to_{args.date_to}"
 
-    output_dir = Path(args.output) if args.output else Path(f"./gopro_downloads/{folder_name}")
+    output_dir = Path(args.output) if args.output else Path("./gopro_downloads")
 
     # Build session
     cookies_str = None
