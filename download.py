@@ -6,7 +6,7 @@ Downloads all media from your GoPro cloud library.
 HOW TO GET YOUR COOKIES:
 1. Open https://gopro.com/media-library in Chrome and log in
 2. Open DevTools (F12) → Network tab
-3. Refresh the page, click any request to api.gopro.com
+3. Refresh the page, click any request to gopro.com
 4. In the Headers section, find the "cookie" request header
 5. Copy the ENTIRE cookie string value
 
@@ -16,11 +16,12 @@ Then run:
 Or save the cookie string to a file and use:
     python download.py --cookie-file cookies.txt
 
-You can also extract just the gp_access_token value from the cookie string
-and pass it with:
-    python download.py --token "eyJhbGci..."
+The script automatically refreshes the access token at startup using your
+session cookies, so you only need to re-copy cookies when your session
+expires (typically after several weeks).
 """
 
+import re
 import sys
 import time
 import argparse
@@ -32,6 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE_URL = "https://api.gopro.com"
+TOKEN_REFRESH_URL = "https://gopro.com/login/api/token-refresh?redirect_uri=https://gopro.com/media-library"
 MEDIA_FIELDS = (
     "filename,id,height,width,item_count,orientation,play_as,"
     "ready_to_view,resolution,source_duration,token,type,"
@@ -82,6 +84,28 @@ def build_session(cookies_str: str | None = None, token: str | None = None) -> r
         session.cookies.set("gp_access_token", token, domain="api.gopro.com")
 
     return session
+
+
+def refresh_access_token(cookies_str: str) -> str | None:
+    """Call the GoPro token-refresh endpoint using session cookies to get a fresh gp_access_token."""
+    s = requests.Session()
+    for part in cookies_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            s.cookies.set(k.strip(), v.strip(), domain="gopro.com")
+    try:
+        resp = s.get(TOKEN_REFRESH_URL, allow_redirects=False, timeout=15)
+        if "gp_access_token" in resp.cookies:
+            return resp.cookies["gp_access_token"]
+        # Fall back to parsing Set-Cookie header directly
+        for header_val in resp.headers.get("set-cookie", "").split(","):
+            m = re.search(r"gp_access_token=([^;,\s]+)", header_val)
+            if m:
+                return m.group(1)
+    except Exception as e:
+        print(f"Warning: token refresh failed: {e}")
+    return None
 
 
 def list_all_media(session: requests.Session) -> list[dict]:
@@ -212,6 +236,7 @@ def download_all(
     output_dir: Path,
     dry_run: bool = False,
     delete_after: bool = False,
+    delete_each: bool = False,
 ):
     """
     date_from / date_to are ISO format (YYYY-MM-DD). ISO dates sort
@@ -264,6 +289,8 @@ def download_all(
         if ok:
             succeeded += 1
             downloaded_ids.append(item["id"])
+            if delete_each:
+                delete_media(session, [item["id"]])
         else:
             failed += 1
         time.sleep(0.2)
@@ -289,7 +316,7 @@ def main():
     auth = parser.add_mutually_exclusive_group(required=True)
     auth.add_argument("--cookies", help="Full cookie string copied from browser DevTools")
     auth.add_argument("--cookie-file", help="Path to a text file containing the cookie string")
-    auth.add_argument("--token", help="Just the gp_access_token value from the cookie")
+    auth.add_argument("--token", help="Just the gp_access_token value (no auto-refresh)")
 
     # Date selection — single date OR explicit range
     date_group = parser.add_mutually_exclusive_group(required=True)
@@ -315,15 +342,21 @@ def main():
     parser.add_argument(
         "--output",
         metavar="PATH",
-        help="Directory to save files (default: ./gopro_downloads/<date>)",
+        help="Directory to save files (default: path from settings.txt, or ./gopro_downloads)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="List files without downloading them",
     )
-    parser.add_argument(
+
+    delete_group = parser.add_mutually_exclusive_group()
+    delete_group.add_argument(
         "--delete-after", action="store_true",
         help="Delete files from GoPro cloud after ALL of them download successfully",
+    )
+    delete_group.add_argument(
+        "--delete", action="store_true",
+        help="Delete each file from GoPro cloud immediately after it downloads successfully",
     )
 
     args = parser.parse_args()
@@ -342,7 +375,14 @@ def main():
         if date_from > date_to:
             parser.error("--from date must not be after --to date")
 
-    output_dir = Path(args.output) if args.output else Path("./gopro_downloads")
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        settings_file = Path(__file__).parent / "settings.txt"
+        if settings_file.exists():
+            output_dir = Path(settings_file.read_text(encoding="utf-8").strip().strip("'\""))
+        else:
+            output_dir = Path("./gopro_downloads")
 
     # Build session
     cookies_str = None
@@ -356,6 +396,15 @@ def main():
 
     session = build_session(cookies_str=cookies_str, token=token)
 
+    if cookies_str:
+        print("Refreshing GoPro access token...", end=" ", flush=True)
+        fresh_token = refresh_access_token(cookies_str)
+        if fresh_token:
+            session.cookies.set("gp_access_token", fresh_token, domain="api.gopro.com")
+            print("OK")
+        else:
+            print("failed — will use token from cookie file (may be expired)")
+
     download_all(
         session=session,
         date_from=date_from,
@@ -363,6 +412,7 @@ def main():
         output_dir=output_dir,
         dry_run=args.dry_run,
         delete_after=args.delete_after,
+        delete_each=args.delete,
     )
 
 

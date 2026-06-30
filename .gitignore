@@ -2,3 +2,4 @@ gopro_downloads/
 cookie.txt
 *.pyc
 __pycache__/
+.DS_Store
